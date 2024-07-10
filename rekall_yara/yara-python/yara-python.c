@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 /* headers */
+#define PY_SSIZE_T_CLEAN
 
 #include <Python.h>
 #include "structmember.h"
