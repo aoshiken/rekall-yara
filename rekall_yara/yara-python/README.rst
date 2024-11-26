@@ -1,5 +1,3 @@
-.. image:: https://travis-ci.org/VirusTotal/yara-python.svg
-    :target: https://travis-ci.org/VirusTotal/yara-python
 .. image:: https://ci.appveyor.com/api/projects/status/gidnb9ulj3rje5s2?svg=true
     :target: https://ci.appveyor.com/project/plusvic/yara-python
 
@@ -24,7 +22,15 @@ Here it goes a little example:
     >>> print(matches[0].tags)
     ['bar']
     >>> print(matches[0].strings)
-    [(10L, '$a', 'lmn')]
+    [$a]
+    >>> print(matches[0].strings[0].identifier)
+    $a
+    >>> print(matches[0].strings[0].instances)
+    [lmn]
+    >>> print(matches[0].strings[0].instances[0].offset)
+    10
+    >>> print(matches[0].strings[0].instances[0].matched_length)
+    3
 
 
 Installation
@@ -53,7 +59,7 @@ dynamically against a shared ``libyara`` library use:
 
 .. code-block:: bash
 
-  $ sudo python setup.py install --dynamic-linking
+  $ python setup.py build --dynamic-linking
 
 For this option to work you must build and install
 `YARA <https://github.com/VirusTotal/yara>`_ separately before installing

@@ -32,18 +32,21 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <yara/types.h>
 
-// Bitmasks for flags.
-#define SCAN_FLAGS_FAST_MODE         1
-#define SCAN_FLAGS_PROCESS_MEMORY    2
-#define SCAN_FLAGS_NO_TRYCATCH       4
-
+//
+// Flags used with yr_scanner_set_flags and yr_rules_scan_xxx functions.
+//
+#define SCAN_FLAGS_FAST_MODE                 1
+#define SCAN_FLAGS_PROCESS_MEMORY            2
+#define SCAN_FLAGS_NO_TRYCATCH               4
+#define SCAN_FLAGS_REPORT_RULES_MATCHING     8
+#define SCAN_FLAGS_REPORT_RULES_NOT_MATCHING 16
 
 int yr_scan_verify_match(
     YR_SCAN_CONTEXT* context,
     YR_AC_MATCH* ac_match,
     const uint8_t* data,
     size_t data_size,
-    size_t data_base,
+    uint64_t data_base,
     size_t offset);
 
 #endif

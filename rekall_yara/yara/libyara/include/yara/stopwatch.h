@@ -30,21 +30,52 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifndef YR_STOPWATCH_H
 #define YR_STOPWATCH_H
 
-#ifdef PROFILING_ENABLED
+#include <time.h>
 #include <yara/integers.h>
+
+#if defined(_WIN32)
+
+#include <windows.h>
 
 typedef struct _YR_STOPWATCH
 {
-  struct timespec ts_start;
+  LARGE_INTEGER frequency;
+  LARGE_INTEGER start;
 
 } YR_STOPWATCH;
 
+#elif defined(__APPLE__) && defined(__MACH__)
 
-void yr_stopwatch_start(
-    YR_STOPWATCH* stopwatch);
+#include <mach/mach_time.h>
 
-uint64_t yr_stopwatch_elapsed_microseconds(
-    YR_STOPWATCH* stopwatch);
+typedef struct _YR_STOPWATCH
+{
+  mach_timebase_info_data_t timebase;
+  uint64_t start;
+
+} YR_STOPWATCH;
+
+#else
+
+#include <sys/time.h>
+
+typedef struct _YR_STOPWATCH
+{
+  union
+  {
+    struct timeval tv_start;
+    struct timespec ts_start;
+  };
+
+} YR_STOPWATCH;
 
 #endif
+
+// yr_stopwatch_start starts measuring time.
+void yr_stopwatch_start(YR_STOPWATCH* stopwatch);
+
+// yr_stopwatch_elapsed_ns returns the number of nanoseconds elapsed
+// since the last call to yr_stopwatch_start.
+uint64_t yr_stopwatch_elapsed_ns(YR_STOPWATCH* stopwatch);
+
 #endif

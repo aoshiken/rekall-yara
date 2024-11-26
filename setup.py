@@ -40,12 +40,24 @@ if '--with-profiling' in args:
 def get_sources(source):
     result = []
     exclusions = set([
-        "modules/cuckoo.c",
-        "modules/magic.c",
-        "modules/hash.c",
+        "modules/cuckoo/cuckoo.c",
+        "modules/demo/demo.c",
+        "modules/dex/dex.c",
+        "modules/hash/hash.c",
+        "modules/macho/macho.c",
+        "modules/magic/magic.c",
+        "modules/pb_tests/pb_tests.c",
+        "modules/pb_tests/pb_tests.pb-c.c",
+        "modules/pe/authenticode-parser/authenticode.c",
+        "modules/pe/authenticode-parser/certificate.c",
+        "modules/pe/authenticode-parser/countersignature.c",
+        "modules/pe/authenticode-parser/helper.c",
+        "modules/pe/authenticode-parser/structs.c",
         "proc/linux.c",
         "proc/windows.c",
         "proc/mach.c",
+        "proc/freebsd.c",
+        "proc/openbsd.c"
     ])
     for directory, _, files in os.walk(source):
         for x in files:
@@ -97,10 +109,16 @@ class BuildExtCommand(build_ext):
                                      "rekall_yara/yara/"))
             subprocess.check_call(
                 ["/bin/sh", "./configure", "--without-crypto",
-                 "--disable-magic", "--disable-cuckoo",
-                 "--disable-dmalloc"],
+                 "--disable-magic", "--disable-cuckoo"],
                 cwd=os.path.join(rekall_yara_dir,
                                  "rekall_yara/yara/"))
+
+        module = self.distribution.ext_modules[0]
+
+        module.define_macros.append(('USE_NO_PROC', '1'))
+        module.define_macros.append(('BUCKETS_128', '1'))
+        module.define_macros.append(('CHECKSUM_1B', '1'))
+        module.define_macros.append(('DOTNET_MODULE', '1'))
 
         build_ext.run(self)
 

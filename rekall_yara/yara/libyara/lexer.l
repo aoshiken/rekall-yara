@@ -53,9 +53,13 @@ with noyywrap then we can remove this pragma.
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #include <windows.h>
-#define strtoll _strtoi64
 #else
+#include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#define strtoll _strtoi64
 #endif
 
 #include <yara/integers.h>
@@ -63,22 +67,35 @@ with noyywrap then we can remove this pragma.
 #include <yara/sizedstr.h>
 #include <yara/error.h>
 #include <yara/mem.h>
+#include <yara/utils.h>
 #include <yara/strutils.h>
 
 #include "grammar.h"
 
+#define error(error_code) \
+    { \
+      compiler->last_error = error_code; \
+      yyerror(yyscanner, compiler, NULL); \
+      yyterminate(); \
+    }
 
-#define LEX_CHECK_SPACE_OK(data, current_size, max_length) \
+#define syntax_error(error_msg) \
+    { \
+      yr_compiler_set_error_extra_info(compiler, error_msg); \
+      error(ERROR_SYNTAX_ERROR); \
+    }
+
+#define lex_check_space_ok(data, current_size, max_length) \
     if (strlen(data) + current_size >= max_length - 1) \
     { \
       yyerror(yyscanner, compiler, "out of space in lex_buf"); \
       yyterminate(); \
     }
 
-#define YYTEXT_TO_BUFFER \
+#define yytext_to_buffer \
     { \
       char *yptr = yytext; \
-      LEX_CHECK_SPACE_OK(yptr, yyextra->lex_buf_len, LEX_BUF_SIZE); \
+      lex_check_space_ok(yptr, yyextra->lex_buf_len, YR_LEX_BUF_SIZE); \
       while(*yptr) \
       { \
         *yyextra->lex_buf_ptr++ = *yptr++; \
@@ -86,7 +103,7 @@ with noyywrap then we can remove this pragma.
       } \
     }
 
-#define ALLOC_SIZED_STRING(str, str_len) \
+#define alloc_sized_string(str, str_len) \
   SIZED_STRING* str = (SIZED_STRING*) yr_malloc( \
       str_len + sizeof(SIZED_STRING)); \
   if (str == NULL) \
@@ -103,6 +120,20 @@ with noyywrap then we can remove this pragma.
 #ifdef _WIN32
 #define snprintf _snprintf
 #endif
+
+static bool is_absolute_path(
+    char* path)
+{
+  if (path == NULL)
+    return false;
+
+  #if defined(_WIN32) || defined(__CYGWIN__)
+  return strlen(path) > 2 &&
+      path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+  #else
+  return strlen(path) > 0 && path[0] == '/';
+  #endif
+}
 
 %}
 
@@ -147,6 +178,9 @@ octdigit      [0-7]
 "strings"               { return _STRINGS_;     }
 "ascii"                 { return _ASCII_;       }
 "wide"                  { return _WIDE_;        }
+"xor"                   { return _XOR_;         }
+"base64"                { return _BASE64_;      }
+"base64wide"            { return _BASE64_WIDE_; }
 "fullword"              { return _FULLWORD_;    }
 "nocase"                { return _NOCASE_;      }
 "condition"             { return _CONDITION_;   }
@@ -162,11 +196,19 @@ octdigit      [0-7]
 "for"                   { return _FOR_;         }
 "all"                   { return _ALL_;         }
 "any"                   { return _ANY_;         }
+"none"                  { return _NONE_;        }
 "entrypoint"            { return _ENTRYPOINT_;  }
 "filesize"              { return _FILESIZE_;    }
 "matches"               { return _MATCHES_;     }
 "contains"              { return _CONTAINS_;    }
+"startswith"            { return _STARTSWITH_;  }
+"endswith"              { return _ENDSWITH_;    }
+"icontains"             { return _ICONTAINS_;   }
+"istartswith"           { return _ISTARTSWITH_; }
+"iendswith"             { return _IENDSWITH_;   }
+"iequals"               { return _IEQUALS_;     }
 "import"                { return _IMPORT_;      }
+"defined"               { return _DEFINED_;     }
 
 
 "/*"                    { BEGIN(comment);       }
@@ -184,30 +226,78 @@ include[ \t]+\"         {
                         }
 
 
-<include>[^\"]+         { YYTEXT_TO_BUFFER; }
+<include>[^\"]+         { yytext_to_buffer; }
 
 
 <include>\"             {
 
   if (compiler->include_callback != NULL)
   {
+    #ifdef _MSC_VER
+    char* b = NULL;
+    #endif
+    char* s = NULL;
+    char* f;
+
+    char buffer[1024];
     const char* included_rules;
     char* current_file_name;
+    char* include_path;
 
     *yyextra->lex_buf_ptr = '\0'; // null-terminate included file path
 
-    // move path of current source file into buffer
     current_file_name = yr_compiler_get_current_file_name(compiler);
 
+    if (current_file_name == NULL ||
+        compiler->include_callback != _yr_compiler_default_include_callback ||
+        is_absolute_path(yyextra->lex_buf))
+    {
+      include_path = yyextra->lex_buf;
+    }
+    else
+    {
+      strlcpy(buffer, current_file_name, sizeof(buffer));
+      s = strrchr(buffer, '/');
+
+      #ifdef _MSC_VER
+      b = strrchr(buffer, '\\'); // in Windows both path delimiters are accepted
+      #endif
+
+      #ifdef _MSC_VER
+      if (s != NULL || b != NULL)
+      #else
+      if (s != NULL)
+      #endif
+      {
+        #ifdef _MSC_VER
+        f = (b > s) ? (b + 1) : (s + 1);
+        #else
+        f = s + 1;
+        #endif
+
+        strlcpy(f, yyextra->lex_buf, sizeof(buffer) - (f - buffer));
+        include_path = buffer;
+      }
+      else
+      {
+        include_path = yyextra->lex_buf;
+      }
+    }
+
+    YR_NAMESPACE* ns = (YR_NAMESPACE*) yr_arena_get_ptr(
+        compiler->arena,
+        YR_NAMESPACES_TABLE,
+        compiler->current_namespace_idx * sizeof(struct YR_NAMESPACE));
+
     included_rules = compiler->include_callback(
-        yyextra->lex_buf,
+        include_path,
         current_file_name,
-        compiler->current_namespace->name,
+        ns->name,
         compiler->incl_clbk_user_data);
 
     if (included_rules != NULL)
     {
-      int error_code = _yr_compiler_push_file_name(compiler, yyextra->lex_buf);
+      int error_code = _yr_compiler_push_file_name(compiler, include_path);
 
       if (error_code != ERROR_SUCCESS)
       {
@@ -273,16 +363,12 @@ include[ \t]+\"         {
 
 <<EOF>> {
 
-  YR_COMPILER* compiler = yyget_extra(yyscanner);
-
-  _yr_compiler_pop_file_name(compiler);
   yypop_buffer_state(yyscanner);
 
   if (!YY_CURRENT_BUFFER)
-  {
     yyterminate();
-  }
 
+  return _END_OF_INCLUDED_FILE_;
 }
 
 
@@ -291,10 +377,7 @@ $({letter}|{digit}|_)*"*"  {
   yylval->c_string = yr_strdup(yytext);
 
   if (yylval->c_string == NULL)
-  {
-    yyerror(yyscanner, compiler, "not enough memory");
-    yyterminate();
-  }
+    error(ERROR_INSUFFICIENT_MEMORY);
 
   return _STRING_IDENTIFIER_WITH_WILDCARD_;
 }
@@ -305,10 +388,7 @@ $({letter}|{digit}|_)*  {
   yylval->c_string = yr_strdup(yytext);
 
   if (yylval->c_string == NULL)
-  {
-    yyerror(yyscanner, compiler, "not enough memory");
-    yyterminate();
-  }
+    error(ERROR_INSUFFICIENT_MEMORY);
 
   return _STRING_IDENTIFIER_;
 }
@@ -320,11 +400,13 @@ $({letter}|{digit}|_)*  {
 
   if (yylval->c_string == NULL)
   {
-    yyerror(yyscanner, compiler, "not enough memory");
-    yyterminate();
+    error(ERROR_INSUFFICIENT_MEMORY);
+  }
+  else
+  {
+    yylval->c_string[0] = '$'; /* replace # by $*/
   }
 
-  yylval->c_string[0] = '$'; /* replace # by $*/
   return _STRING_COUNT_;
 }
 
@@ -335,11 +417,13 @@ $({letter}|{digit}|_)*  {
 
   if (yylval->c_string == NULL)
   {
-    yyerror(yyscanner, compiler, "not enough memory");
-    yyterminate();
+    error(ERROR_INSUFFICIENT_MEMORY);
+  }
+  else
+  {
+    yylval->c_string[0] = '$'; /* replace @ by $*/
   }
 
-  yylval->c_string[0] = '$'; /* replace @ by $*/
   return _STRING_OFFSET_;
 }
 
@@ -350,11 +434,13 @@ $({letter}|{digit}|_)*  {
 
   if (yylval->c_string == NULL)
   {
-    yyerror(yyscanner, compiler, "not enough memory");
-    yyterminate();
+    error(ERROR_INSUFFICIENT_MEMORY);
+  }
+  else
+  {
+    yylval->c_string[0] = '$'; /* replace ! by $*/
   }
 
-  yylval->c_string[0] = '$'; /* replace ! by $*/
   return _STRING_LENGTH_;
 }
 
@@ -401,17 +487,12 @@ u?int(8|16|32)(be)? {
 ({letter}|_)({letter}|{digit}|_)*  {
 
   if (strlen(yytext) > 128)
-  {
-    yyerror(yyscanner, compiler, "identifier too long");
-  }
+    syntax_error("identifier too long");
 
   yylval->c_string = yr_strdup(yytext);
 
   if (yylval->c_string == NULL)
-  {
-    yyerror(yyscanner, compiler, "not enough memory");
-    yyterminate();
-  }
+    error(ERROR_INSUFFICIENT_MEMORY);
 
   return _IDENTIFIER_;
 }
@@ -421,31 +502,37 @@ u?int(8|16|32)(be)? {
 
   char *endptr;
 
+  errno = 0;
   yylval->integer = strtoll(yytext, &endptr, 10);
 
   if (yylval->integer == LLONG_MAX && errno == ERANGE)
   {
-    yyerror(yyscanner, compiler, "integer too long");
-    yyterminate();
+    yr_compiler_set_error_extra_info(compiler, yytext);
+    error(ERROR_INTEGER_OVERFLOW);
   }
-
-  if (strstr(yytext, "KB") != NULL)
+  else if (strstr(yytext, "KB") != NULL)
   {
     if (yylval->integer > LLONG_MAX / 1024)
     {
-      yyerror(yyscanner, compiler, "integer too long");
-      yyterminate();
+      yr_compiler_set_error_extra_info(compiler, yytext);
+      error(ERROR_INTEGER_OVERFLOW);
     }
-    yylval->integer *= 1024;
+    else
+    {
+      yylval->integer *= 1024;
+    }
   }
   else if (strstr(yytext, "MB") != NULL)
   {
     if (yylval->integer > LLONG_MAX / 1048576)
     {
-      yyerror(yyscanner, compiler, "integer too long");
-      yyterminate();
+      yr_compiler_set_error_extra_info(compiler, yytext);
+      error(ERROR_INTEGER_OVERFLOW);
     }
-    yylval->integer *= 1048576;
+    else
+    {
+      yylval->integer *= 1048576;
+    }
   }
 
   return _NUMBER_;
@@ -459,12 +546,14 @@ u?int(8|16|32)(be)? {
 0x{hexdigit}+  {
 
   char *endptr;
+
+  errno = 0;
   yylval->integer = strtoll(yytext, &endptr, 16);
 
   if (yylval->integer == LLONG_MAX && errno == ERANGE)
   {
-    yyerror(yyscanner, compiler, "integer too long");
-    yyterminate();
+    yr_compiler_set_error_extra_info(compiler, yytext);
+    error(ERROR_INTEGER_OVERFLOW);
   }
 
   return _NUMBER_;
@@ -473,12 +562,14 @@ u?int(8|16|32)(be)? {
 0o{octdigit}+  {
 
   char *endptr;
+
+  errno = 0;
   yylval->integer = strtoll(yytext + 2, &endptr, 8);
 
   if (yylval->integer == LLONG_MAX && errno == ERANGE)
   {
-    yyerror(yyscanner, compiler, "integer too long");
-    yyterminate();
+    yr_compiler_set_error_extra_info(compiler, yytext);
+    error(ERROR_INTEGER_OVERFLOW);
   }
 
   return _NUMBER_;
@@ -487,10 +578,11 @@ u?int(8|16|32)(be)? {
 
 <str>\"   {     /* saw closing quote - all done */
 
-  ALLOC_SIZED_STRING(s, yyextra->lex_buf_len);
+  alloc_sized_string(s, yyextra->lex_buf_len);
 
   *yyextra->lex_buf_ptr = '\0';
   memcpy(s->c_string, yyextra->lex_buf, yyextra->lex_buf_len + 1);
+
   yylval->sized_string = s;
 
   BEGIN(INITIAL);
@@ -501,15 +593,23 @@ u?int(8|16|32)(be)? {
 
 <str>\\t   {
 
-  LEX_CHECK_SPACE_OK("\t", yyextra->lex_buf_len, LEX_BUF_SIZE);
+  lex_check_space_ok("\t", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
   *yyextra->lex_buf_ptr++ = '\t';
+  yyextra->lex_buf_len++;
+}
+
+
+<str>\\r   {
+
+  lex_check_space_ok("\r", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
+  *yyextra->lex_buf_ptr++ = '\r';
   yyextra->lex_buf_len++;
 }
 
 
 <str>\\n   {
 
-  LEX_CHECK_SPACE_OK("\n", yyextra->lex_buf_len, LEX_BUF_SIZE);
+  lex_check_space_ok("\n", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
   *yyextra->lex_buf_ptr++ = '\n';
   yyextra->lex_buf_len++;
 }
@@ -517,7 +617,7 @@ u?int(8|16|32)(be)? {
 
 <str>\\\"   {
 
-  LEX_CHECK_SPACE_OK("\"", yyextra->lex_buf_len, LEX_BUF_SIZE);
+  lex_check_space_ok("\"", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
   *yyextra->lex_buf_ptr++ = '\"';
   yyextra->lex_buf_len++;
 }
@@ -525,7 +625,7 @@ u?int(8|16|32)(be)? {
 
 <str>\\\\   {
 
-  LEX_CHECK_SPACE_OK("\\", yyextra->lex_buf_len, LEX_BUF_SIZE);
+  lex_check_space_ok("\\", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
   *yyextra->lex_buf_ptr++ = '\\';
   yyextra->lex_buf_len++;
 }
@@ -533,28 +633,25 @@ u?int(8|16|32)(be)? {
 
 <str>\\x{hexdigit}{2} {
 
-   int result;
+  int result;
 
-   sscanf( yytext + 2, "%x", &result );
-   LEX_CHECK_SPACE_OK("X", yyextra->lex_buf_len, LEX_BUF_SIZE);
-   *yyextra->lex_buf_ptr++ = result;
-   yyextra->lex_buf_len++;
+  sscanf(yytext + 2, "%x", &result);
+  lex_check_space_ok("X", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
+  *yyextra->lex_buf_ptr++ = result;
+  yyextra->lex_buf_len++;
 }
 
 
-<str>[^\\\n\"]+   { YYTEXT_TO_BUFFER; }
+<str>[^\\\n\"]+   { yytext_to_buffer; }
 
 
 <str>\n  {
-
-  yyerror(yyscanner, compiler, "unterminated string");
-  yyterminate();
+  syntax_error("unterminated string");
 }
 
-<str>\\(.|\n) {
 
-  yyerror(yyscanner, compiler, "illegal escape sequence");
-  yyterminate();
+<str>\\(.|\n) {
+  syntax_error("illegal escape sequence");
 }
 
 
@@ -562,7 +659,7 @@ u?int(8|16|32)(be)? {
 
   if (yyextra->lex_buf_len > 0)
   {
-    ALLOC_SIZED_STRING(s, yyextra->lex_buf_len);
+    alloc_sized_string(s, yyextra->lex_buf_len);
 
     if (yytext[1] == 'i')
       s->flags |= SIZED_STRING_FLAGS_NO_CASE;
@@ -572,12 +669,12 @@ u?int(8|16|32)(be)? {
 
     *yyextra->lex_buf_ptr = '\0';
     strlcpy(s->c_string, yyextra->lex_buf, s->length + 1);
+
     yylval->sized_string = s;
   }
   else
   {
-    yyerror(yyscanner, compiler, "empty regular expression");
-    yyterminate();
+    syntax_error("empty regular expression");
   }
 
   BEGIN(INITIAL);
@@ -587,7 +684,7 @@ u?int(8|16|32)(be)? {
 
 <regexp>\\\/  {
 
-  LEX_CHECK_SPACE_OK("/", yyextra->lex_buf_len, LEX_BUF_SIZE);
+  lex_check_space_ok("/", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
   *yyextra->lex_buf_ptr++ = '/';
   yyextra->lex_buf_len++ ;
 }
@@ -595,13 +692,10 @@ u?int(8|16|32)(be)? {
 
 <regexp>\\. {
 
-  LEX_CHECK_SPACE_OK("\\.", yyextra->lex_buf_len, LEX_BUF_SIZE);
+  lex_check_space_ok("\\.", yyextra->lex_buf_len, YR_LEX_BUF_SIZE);
 
   if (yytext[1] == 0)
-  {
-    yyerror(yyscanner, compiler, "malformed regular expression");
-    yyterminate();
-  }
+    syntax_error("malformed regular expression");
 
   *yyextra->lex_buf_ptr++ = yytext[0];
   *yyextra->lex_buf_ptr++ = yytext[1];
@@ -609,18 +703,17 @@ u?int(8|16|32)(be)? {
 }
 
 
-<regexp>[^/\n\\]+ { YYTEXT_TO_BUFFER; }
+<regexp>[^/\n\\]+ { yytext_to_buffer; }
 
 
 <regexp>\n  {
-
-  yyerror(yyscanner, compiler, "unterminated regular expression");
-  yyterminate();
+  syntax_error("unterminated regular expression");
 }
 
 
 \"  {
 
+  yylval->sized_string = NULL;
   yyextra->lex_buf_ptr = yyextra->lex_buf;
   yyextra->lex_buf_len = 0;
   BEGIN(str);
@@ -629,17 +722,22 @@ u?int(8|16|32)(be)? {
 
 "/"  {
 
+  yylval->sized_string = NULL;
   yyextra->lex_buf_ptr = yyextra->lex_buf;
   yyextra->lex_buf_len = 0;
   BEGIN(regexp);
 }
 
 
-\{(({hexdigit}|[ \-|\?\[\]\(\)\n\r\t]|\/\*[^*]*\*\/)+|\/\/.*)+\}  {
+\{(({hexdigit}|[ \-|\~\?\[\]\(\)\n\r\t]|\/\*(\/|\**[^*/])*\*+\/)+|\/\/.*\n)+\}  {
   // Match hex-digits with whitespace or comments. The latter are stripped
   // out by hex_lexer.l
+  // TODO(vmalvarez): Integrate the hex string lexer and parser into this one,
+  // by having a single lexer/parser instead of two different ones we can avoid
+  // complex regular expressions like the one above, which is actually trying to
+  // do some parsing in the lexer.
 
-  ALLOC_SIZED_STRING(s, strlen(yytext));
+  alloc_sized_string(s, strlen(yytext));
 
   strlcpy(s->c_string, yytext, s->length + 1);
   yylval->sized_string = s;
@@ -658,8 +756,7 @@ u?int(8|16|32)(be)? {
   }
   else
   {
-    yyerror(yyscanner, compiler, "non-ascii character");
-    yyterminate();
+    syntax_error("non-ascii character");
   }
 }
 
@@ -689,10 +786,19 @@ void yywarning(
 
   vsnprintf(message, sizeof(message), message_fmt, message_args);
 
+  YR_RULE* current_rule = NULL;
+
+  if (compiler->current_rule_idx != UINT32_MAX)
+    current_rule = yr_arena_get_ptr(
+        compiler->arena,
+        YR_RULES_TABLE,
+        compiler->current_rule_idx * sizeof(YR_RULE));
+
   compiler->callback(
       YARA_ERROR_LEVEL_WARNING,
       file_name,
       compiler->current_line ? compiler->current_line : yyget_lineno(yyscanner),
+      current_rule,
       message,
       compiler->user_data);
 
@@ -719,12 +825,6 @@ void yyerror(
   char message[512] = {'\0'};
   char* file_name = NULL;
 
-  /*
-    if error_message != NULL the error comes from yyparse internal code
-    else the error comes from my code and the error code is set in
-    compiler->last_result
-  */
-
   compiler->errors++;
 
   if (compiler->current_line != 0)
@@ -743,6 +843,18 @@ void yyerror(
     file_name = NULL;
   }
 
+  YR_RULE* current_rule = NULL;
+
+  if (compiler->current_rule_idx != UINT32_MAX)
+    current_rule = yr_arena_get_ptr(
+        compiler->arena,
+        YR_RULES_TABLE,
+        compiler->current_rule_idx * sizeof(YR_RULE));
+
+  // if error_message != NULL the error comes from yyparse internal code
+  // else the error comes from my code and the error code is set in
+  // compiler->last_error
+
   if (error_message != NULL)
   {
     yr_compiler_set_error_extra_info(compiler, error_message);
@@ -754,43 +866,76 @@ void yyerror(
           YARA_ERROR_LEVEL_ERROR,
           file_name,
           compiler->last_error_line,
+          current_rule,
           error_message,
           compiler->user_data);
     }
   }
-  else
+  else if (compiler->callback != NULL)
   {
-    compiler->last_error = compiler->last_result;
+    yr_compiler_get_error_message(compiler, message, sizeof(message));
 
-    if (compiler->callback != NULL)
-    {
-      yr_compiler_get_error_message(compiler, message, sizeof(message));
-
-      compiler->callback(
+    compiler->callback(
         YARA_ERROR_LEVEL_ERROR,
         file_name,
         compiler->last_error_line,
+        current_rule,
         message,
         compiler->user_data);
-    }
   }
-
-  compiler->last_result = ERROR_SUCCESS;
 }
 
 
-int yr_lex_parse_rules_string(
-  const char* rules_string,
-  YR_COMPILER* compiler)
+int yr_lex_parse_rules_bytes(
+    const void* rules_data,
+    size_t rules_size,
+    YR_COMPILER* compiler)
 {
   yyscan_t yyscanner;
 
   compiler->errors = 0;
 
+  if (yylex_init(&yyscanner) != 0)
+  {
+    compiler->errors = 1;
+    compiler->last_error = ERROR_INSUFFICIENT_MEMORY;
+    return compiler->errors;
+  }
+
   if (setjmp(compiler->error_recovery) != 0)
     return compiler->errors;
 
-  yylex_init(&yyscanner);
+  #if YYDEBUG
+  yydebug = 1;
+  #endif
+
+  yyset_extra(compiler, yyscanner);
+  yy_scan_bytes(rules_data, rules_size, yyscanner);
+  yyset_lineno(1, yyscanner);
+  yyparse(yyscanner, compiler);
+  yylex_destroy(yyscanner);
+
+  return compiler->errors;
+}
+
+
+int yr_lex_parse_rules_string(
+    const char* rules_string,
+    YR_COMPILER* compiler)
+{
+  yyscan_t yyscanner;
+
+  compiler->errors = 0;
+
+  if (yylex_init(&yyscanner) != 0)
+  {
+    compiler->errors = 1;
+    compiler->last_error = ERROR_INSUFFICIENT_MEMORY;
+    return compiler->errors;
+  }
+
+  if (setjmp(compiler->error_recovery) != 0)
+    return compiler->errors;
 
   #if YYDEBUG
   yydebug = 1;
@@ -807,17 +952,22 @@ int yr_lex_parse_rules_string(
 
 
 int yr_lex_parse_rules_file(
-  FILE* rules_file,
-  YR_COMPILER* compiler)
+    FILE* rules_file,
+    YR_COMPILER* compiler)
 {
   yyscan_t yyscanner;
 
   compiler->errors = 0;
 
+  if (yylex_init(&yyscanner) != 0)
+  {
+    compiler->errors = 1;
+    compiler->last_error = ERROR_INSUFFICIENT_MEMORY;
+    return compiler->errors;
+  }
+
   if (setjmp(compiler->error_recovery) != 0)
     return compiler->errors;
-
-  yylex_init(&yyscanner);
 
   #if YYDEBUG
   yydebug = 1;
@@ -833,48 +983,75 @@ int yr_lex_parse_rules_file(
 
 
 int yr_lex_parse_rules_fd(
-  YR_FILE_DESCRIPTOR rules_fd,
-  YR_COMPILER* compiler)
+    YR_FILE_DESCRIPTOR rules_fd,
+    YR_COMPILER* compiler)
 {
   yyscan_t yyscanner;
-  char buf[1024];
+  size_t file_size;
+  void* buffer;
+
+  #if defined(_WIN32) || defined(__CYGWIN__)
+  DWORD bytes_read;
+  #endif
 
   compiler->errors = 0;
 
   if (setjmp(compiler->error_recovery) != 0)
     return compiler->errors;
 
-  yylex_init(&yyscanner);
+  #if defined(_WIN32) || defined(__CYGWIN__)
+  file_size = (size_t) GetFileSize(rules_fd, NULL);
+  #else
+  struct stat fs;
+  if (fstat(rules_fd, &fs) != 0)
+  {
+    compiler->errors = 1;
+    compiler->last_error = ERROR_COULD_NOT_READ_FILE;
+    return compiler->errors;
+  }
+  file_size = (size_t) fs.st_size;
+  #endif
+
+  buffer = yr_malloc(file_size);
+
+  if (buffer == NULL)
+  {
+    compiler->errors = 1;
+    compiler->last_error = ERROR_INSUFFICIENT_MEMORY;
+    return compiler->errors;
+  }
+
+  #if defined(_WIN32) || defined(__CYGWIN__)
+  if (!ReadFile(rules_fd, buffer, file_size, &bytes_read, NULL))
+  #else
+  if (read(rules_fd, buffer, file_size) != file_size)
+  #endif
+  {
+    yr_free(buffer);
+    compiler->errors = 1;
+    compiler->last_error = ERROR_COULD_NOT_READ_FILE;
+    return compiler->errors;
+  }
+
+  if (yylex_init(&yyscanner) != 0)
+  {
+    yr_free(buffer);
+    compiler->errors = 1;
+    compiler->last_error = ERROR_INSUFFICIENT_MEMORY;
+    return compiler->errors;
+  }
 
   #if YYDEBUG
   yydebug = 1;
   #endif
 
   yyset_extra(compiler, yyscanner);
-
-  while (1)
-  {
-#if defined(_WIN32) || defined(__CYGWIN__)
-    DWORD len;
-    if (!ReadFile(rules_fd, buf, sizeof(buf), &len, NULL))
-      break;
-#else
-    int len = (int) read(rules_fd, buf, sizeof(buf));
-    if (len < 0)
-    {
-      if (errno == EINTR)
-        continue;
-      else
-        break;
-    }
-#endif
-    if (len == 0)
-      break;
-    yy_scan_bytes(buf, len, yyscanner);
-  }
-
+  yy_scan_bytes((const char*) buffer, (int) file_size, yyscanner);
+  yyset_lineno(1, yyscanner);
   yyparse(yyscanner, compiler);
   yylex_destroy(yyscanner);
+
+  yr_free(buffer);
 
   return compiler->errors;
 }

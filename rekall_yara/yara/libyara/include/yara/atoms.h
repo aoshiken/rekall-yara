@@ -33,70 +33,103 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <yara/limits.h>
 #include <yara/re.h>
 
-#define ATOM_TREE_LEAF  1
-#define ATOM_TREE_AND   2
-#define ATOM_TREE_OR    3
+#define ATOM_TREE_LEAF 1
+#define ATOM_TREE_AND  2
+#define ATOM_TREE_OR   3
 
+typedef struct YR_ATOM YR_ATOM;
+typedef struct YR_ATOM_TREE_NODE YR_ATOM_TREE_NODE;
+typedef struct YR_ATOM_TREE YR_ATOM_TREE;
 
-typedef struct _ATOM_TREE_NODE
+typedef struct YR_ATOM_LIST_ITEM YR_ATOM_LIST_ITEM;
+
+typedef struct YR_ATOM_QUALITY_TABLE_ENTRY YR_ATOM_QUALITY_TABLE_ENTRY;
+typedef struct YR_ATOMS_CONFIG YR_ATOMS_CONFIG;
+
+struct YR_ATOM
+{
+  uint8_t length;
+  uint8_t bytes[YR_MAX_ATOM_LENGTH];
+  uint8_t mask[YR_MAX_ATOM_LENGTH];
+};
+
+struct YR_ATOM_TREE_NODE
 {
   uint8_t type;
-  uint8_t atom_length;
-  uint8_t atom[MAX_ATOM_LENGTH];
 
-  uint8_t* forward_code;
-  uint8_t* backward_code;
+  YR_ATOM atom;
 
-  RE_NODE* recent_nodes[MAX_ATOM_LENGTH];
+  // RE nodes that correspond to each byte in the atom.
+  RE_NODE* re_nodes[YR_MAX_ATOM_LENGTH];
 
-  struct _ATOM_TREE_NODE* children_head;
-  struct _ATOM_TREE_NODE* children_tail;
-  struct _ATOM_TREE_NODE* next_sibling;
+  YR_ATOM_TREE_NODE* children_head;
+  YR_ATOM_TREE_NODE* children_tail;
+  YR_ATOM_TREE_NODE* next_sibling;
+};
 
-} ATOM_TREE_NODE;
-
-
-typedef struct _ATOM_TREE
+struct YR_ATOM_TREE
 {
-  ATOM_TREE_NODE* current_leaf;
-  ATOM_TREE_NODE* root_node;
+  YR_ATOM_TREE_NODE* root_node;
+};
 
-} ATOM_TREE;
-
-
-typedef struct _YR_ATOM_LIST_ITEM
+struct YR_ATOM_LIST_ITEM
 {
-  uint8_t atom_length;
-  uint8_t atom[MAX_ATOM_LENGTH];
+  YR_ATOM atom;
 
   uint16_t backtrack;
 
-  uint8_t* forward_code;
-  uint8_t* backward_code;
+  YR_ARENA_REF forward_code_ref;
+  YR_ARENA_REF backward_code_ref;
 
-  struct _YR_ATOM_LIST_ITEM* next;
+  YR_ATOM_LIST_ITEM* next;
+};
 
-} YR_ATOM_LIST_ITEM;
+#pragma pack(push)
+#pragma pack(1)
 
+struct YR_ATOM_QUALITY_TABLE_ENTRY
+{
+  const uint8_t atom[YR_MAX_ATOM_LENGTH];
+  const uint8_t quality;
+};
+
+#pragma pack(pop)
+
+typedef int (*YR_ATOMS_QUALITY_FUNC)(YR_ATOMS_CONFIG* config, YR_ATOM* atom);
+
+struct YR_ATOMS_CONFIG
+{
+  YR_ATOMS_QUALITY_FUNC get_atom_quality;
+  YR_ATOM_QUALITY_TABLE_ENTRY* quality_table;
+
+  int quality_warning_threshold;
+  int quality_table_entries;
+  bool free_quality_table;
+};
 
 int yr_atoms_extract_from_re(
+    YR_ATOMS_CONFIG* config,
     RE_AST* re_ast,
-    int flags,
-    YR_ATOM_LIST_ITEM** atoms);
-
+    YR_MODIFIER modifier,
+    YR_ATOM_LIST_ITEM** atoms,
+    int* min_atom_quality);
 
 int yr_atoms_extract_from_string(
+    YR_ATOMS_CONFIG* config,
     uint8_t* string,
     int string_length,
-    int flags,
-    YR_ATOM_LIST_ITEM** atoms);
+    YR_MODIFIER modifier,
+    YR_ATOM_LIST_ITEM** atoms,
+    int* min_atom_quality);
 
+int yr_atoms_extract_triplets(RE_NODE* re_node, YR_ATOM_LIST_ITEM** atoms);
 
-int yr_atoms_min_quality(
-    YR_ATOM_LIST_ITEM* atom_list);
+int yr_atoms_heuristic_quality(YR_ATOMS_CONFIG* config, YR_ATOM* atom);
 
+int yr_atoms_table_quality(YR_ATOMS_CONFIG* config, YR_ATOM* atom);
 
-void yr_atoms_list_destroy(
-    YR_ATOM_LIST_ITEM* list_head);
+int yr_atoms_min_quality(YR_ATOMS_CONFIG* config, YR_ATOM_LIST_ITEM* atom_list);
+
+void yr_atoms_list_destroy(YR_ATOM_LIST_ITEM* list_head);
 
 #endif
